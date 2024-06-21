@@ -1,163 +1,103 @@
-"""
- This controller is made by group 12,
-
- using already prepared functions and hints
- from "Beispiel Code":
- 03_opencv.py03_opencv.py
- 04_opencv_color_blob.py
- 05_opencv_color_blob_extended.py
- mycamera.pymycamera.py
-"""
-
+import cv2
 import math
+import numpy as np
 from controller import Robot, Camera
 
-#import for picture detection
-import cv2
-import numpy as np
+HUE_YELLOW = 60 / 2   # yellow hue value in OpenCV HSV
+TRACKING_SPEED = 0.02 # larger values increase the speed of head motors
+# Seconds to wait before looking around when loosing track of an object
+PANIC_DELAY = 1
 
+# Threshold for the moment's zero area (MM0) in center_of_mass()
+MOMENT_ZERO_THRESH = 10
 
-robot = Robot()
+# upper and lower bounds of saturation and value in center_of_mass()
+SAT_LOWER = 180
+SAT_UPPER = 200
+VAL_LOWER = 200
+VAL_UPPER = 255
 
-# we process each image every 40ms = 25fps
-timestep = int(robot.getBasicTimeStep() * 4)
+# Calculate the center of mass of the largest contour of a given
+# hue in an image
+def center_of_mass(img, hue):
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    img = cv2.medianBlur(img, 9)
+    lower = np.array([hue-10, SAT_LOWER, VAL_LOWER])
+    upper = np.array([hue+10, SAT_UPPER, VAL_UPPER])
+    mask = cv2.inRange(img, lower, upper)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE)
+    if len(contours) == 0:
+        # No contour within the specified color range found
+        return (None, None)
 
-# get access to the cameras and enable them
-camera_top    = robot.getDevice("CameraTop")
-camera_top.enable(timestep)
+    largest_contour = max(contours, key=cv2.contourArea)
+    moments = cv2.moments(largest_contour)
+    if moments["m00"] < MOMENT_ZERO_THRESH:
+        # Discard as what weve found is too small to be our duck
+        return (None, None)
 
-## enable the bottom camera if necessary
-camera_bottom = robot.getDevice("CameraBottom")
-camera_bottom.enable(timestep)
+    center_x = int(moments["m10"] / moments["m00"])
+    center_y = int(moments["m01"] / moments["m00"])
+    return (center_x, center_y)
 
-head_yaw   = robot.getDevice("HeadYaw")
-head_pitch = robot.getDevice("HeadPitch")
+def move_arms_down(robot):
+    lShoulderPitch = robot.getDevice("LShoulderPitch")
+    rShoulderPitch = robot.getDevice("RShoulderPitch")
+    lShoulderPitch.setPosition( math.radians(90) )
+    rShoulderPitch.setPosition( math.radians(90) )
 
-# move arms down
-lShoulderPitch = robot.getDevice("LShoulderPitch")
-rShoulderPitch = robot.getDevice("RShoulderPitch")
-lShoulderPitch.setPosition( math.radians(90) )
-rShoulderPitch.setPosition( math.radians(90) )
+def main():
+    robot = Robot()
 
-# Get image and convert into a NumPy array
-def getImage(camera):
-    height = camera.getHeight()
-    width = camera.getWidth()
-    img = camera.getImage()
-    img = np.frombuffer(img, dtype=np.uint8)
-    img = img.reshape((height, width, 4))
-    img = img[:,:,[0,1,2]] # last channel not needed
-    return img
+    # we process each image every 40ms = 25fps
+    timestep = int(robot.getBasicTimeStep() * 4)
 
-while robot.step(timestep) != -1:
-    # current time in s
-    t = robot.getTime()
+    # get access to the cameras and enable them
+    camera_top    = robot.getDevice("CameraTop")
+    camera_top.enable(timestep)
 
-    ###################################################################
-    # Find duck block
-    #################
+    head_yaw   = robot.getDevice("HeadYaw")
+    head_pitch = robot.getDevice("HeadPitch")
+    move_arms_down(robot)
 
-    # same as img = cv2.imread('robocup.png')
-    img = getImage(camera_top)
-    # For debugging:
-    cv2.imshow('CameraTop',img)
+    # Last time we saw the duck
+    last_time_seen = 0
+    while robot.step(timestep) != -1:
+        # current time in s
+        t = robot.getTime()
 
-    # convert to hsv
-    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # getImage() returns a byte string, which needs to be converted
+        # into a BGR array for center_of_mass() / OpenCV
+        img = np.frombuffer(camera_top.getImage(), dtype=np.uint8)
+        img = img.reshape((camera_top.getHeight(),
+            camera_top.getWidth(), 4))
 
-    # define range of blue color in HSV
-    # regular: H \in [0,360]
-    # opencv : H \in [0,180]
-    h = 320/2
-    # lower and upper - define a block, what we are looking for Yellow collor (duck)
-    lower = np.array([h-160, 180, 150])
-    upper = np.array([h-120, 210, 255])
+        (center_x, center_y) = center_of_mass(img, HUE_YELLOW)
+        if center_x and center_y:
+            last_time_seen = t
 
-    # mask color. Find this block in hsv image
-    mask = cv2.inRange(hsv, lower, upper)
+            # switch to velocity control mode
+            head_yaw.setPosition(float('inf'))
+            head_pitch.setPosition(float('inf'))
+            
+            # set velocity based on how far the center of mass is from
+            # the center of the camera view
+            error_x = camera_top.getWidth() / 2 - center_x
+            error_y = camera_top.getHeight() / 2 - center_y
+            head_yaw.setVelocity(error_x * TRACKING_SPEED)
+            head_pitch.setVelocity(-error_y * TRACKING_SPEED)
+        elif (t - last_time_seen) > PANIC_DELAY:
+            # We've lost track of the duck! Look around to find it again.
+            # switch to position control mode
+            head_yaw.setVelocity(head_yaw.getMaxVelocity())
+            head_pitch.setVelocity(head_pitch.getMaxVelocity())
+            # calculate the target joints
+            target_head_yaw   = math.radians(110) * math.sin(t)
+            target_head_pitch = math.radians(10)
+            # set joints
+            head_yaw.setPosition(target_head_yaw)
+            head_pitch.setPosition(target_head_pitch)
 
-    # For debugging:
-    cv2.imshow('color mask',mask)
-
-    ###################################################################
-    # Adapt Mask with morphological operations
-    ##########################################
-
-    # adapt the mask
-    kernel = np.ones((3,3),np.uint8)
-    # Erosion: Removes (erodes) small objects from the image.
-    mask = cv2.erode(mask,kernel,iterations = 3)
-    # Dilation: Fills (dilates) the remaining objects.
-    mask = cv2.dilate(mask,kernel,iterations = 15)
-    # 15 - as the duck is sometimes turned at an angle where the torso and
-    # nose are visible and there is too large a gap between them to be recognized as a separate object
-    mask = cv2.erode(mask,kernel,iterations = 5) # TODO: More precise? We can discuss
-
-    # alternative to erode/dilate opening = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    # with cv2.MORPH_OPEN or cv2.MORPH_CLOSE
-
-    # For debugging:
-    cv2.imshow('color mask + morphological operations',mask)
-
-    ###################################################################
-    # Use the mask to find the outline of the duck in the picture
-    #############################################################
-
-    # detect contours
-    contours, hierarchy = cv2.findContours(image=mask, mode=cv2.RETR_TREE, method=cv2.CHAIN_APPROX_NONE)
-
-    # For debugging:
-    # If you are using/not using img_result -> you will need to enable/disable debugging #1, #2 and #3
-    img_result = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-    for c in contours:
-        # calculate and dra the bounding box :)
-        rect = cv2.boundingRect(c)
-        x, y, w, h = rect  # unpack
-
-        # For debugging #1:
-        cv2.rectangle(img_result, (x, y), (x + w, y + h), (255, 0, 0), 1)
-
-        # calculate moments
-        M = cv2.moments(c)
-
-        # moment_{0,0} = Area/ Number of Pixels inside the contour
-        a = M["m00"]
-
-        # non empty
-        if a > 0:
-            # calculate the center of mass (COM)
-            cX = int(M["m10"] / a)  # average x-coordinate
-            cY = int(M["m01"] / a)  # average y-coordinate
-
-            # For debugging #2:
-            cv2.circle(img_result, (cX, cY), 3, (255, 0, 0), -1)
-
-    # For debugging #3:
-    center_coordinates = (img.shape[1] // 2, img.shape[0] // 2) # Center of the image
-    print((cX, cY))
-    print(center_coordinates)
-    cv2.circle(img_result, center_coordinates, 2, (0, 0, 255), -1)
-    cv2.imshow('Result',img_result)
-
-    ###################################################################
-
-    # save frames (slows down the simulation)
-    #camera_top.saveImage('./{}.png'.format(t), 100)
-
-    # calculate the target joints
-    target_head_yaw   = math.radians(100) * math.sin(t)
-    target_head_pitch = math.radians(10) * math.cos(t)
-
-    # set joints / move head
-    # Horizont axis
-    #head_yaw.setPosition(target_head_yaw)
-    # Vertikal axis
-    #head_pitch.setPosition(target_head_pitch)
-
-
-
-    # show all images | don't block
-    cv2.waitKey(1)
-
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
